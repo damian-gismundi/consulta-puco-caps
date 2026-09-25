@@ -124,46 +124,56 @@ async def get_puco(dni: str):
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            # Lanzar Chromium con flags para entornos cloud reducidos
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            )
             page = await browser.new_page()
 
-            # Ir a la landing de SISA
+            # 1. Cargar la home de SISA
             await page.goto("https://sisa.msal.gov.ar/sisa/#sisa", timeout=45000)
 
-            # Esperar a que aparezca el input de texto del buscador
-            input_locator = page.locator('input[type="text"]').first
-            await input_locator.wait_for(timeout=20000)
-            
-            # Escribir el DNI
-            await input_locator.fill(dni_limpio)
+            # 2. Hacer clic en el acceso directo de PUCO
+            # Buscamos el elemento que contiene el texto PUCO en los banners/tarjetas
+            boton_puco = page.locator('text="PUCO"').first
+            await boton_puco.wait_for(timeout=15000)
+            await boton_puco.click()
 
-            # Hacer clic en el botón Buscar
-            btn_buscar = page.locator('button:has-text("Buscar")').first
+            # 3. Esperar que aparezca el campo de texto de búsqueda de PUCO
+            # En la captura de SISA el placeholder es "Ingrese el valor"
+            input_dni = page.locator('input[placeholder*="valor"], input[type="text"]:visible').first
+            await input_dni.wait_for(timeout=20000)
+            
+            # 4. Escribir el DNI
+            await input_dni.fill(dni_limpio)
+
+            # 5. Clic en Buscar
+            btn_buscar = page.locator('button:has-text("Buscar"), div[role="button"]:has-text("Buscar")').first
             await btn_buscar.click()
 
-            # Esperar a que renderice la tabla de resultados (damos unos segundos para que cargue GWT)
+            # 6. Esperar a que la tabla cargue los resultados
             await page.wait_for_timeout(3500)
 
-            # Extraer las filas de la tabla de resultados
+            # 7. Extraer los datos de las filas
             filas_datos = []
+            nombre_encontrado = None
+
             rows = page.locator("table tr")
             count = await rows.count()
-
-            nombre_encontrado = None
 
             for i in range(count):
                 row = rows.nth(i)
                 text = await row.inner_text()
-                # Verificar si la fila contiene el DNI buscado para asegurarnos de que es un resultado válido
+                
                 if dni_limpio in text:
                     cols = [c.strip() for c in text.split("\t") if c.strip()]
                     if len(cols) >= 5:
-                        # Estructura típica SISA: TipoDoc | NroDoc | Sexo | Cobertura | Denominación
                         tipodoc = cols[0]
                         nrodoc = cols[1]
                         cobertura = cols[3]
                         denominacion = cols[4]
-                        
+
                         if not nombre_encontrado:
                             nombre_encontrado = denominacion
 
