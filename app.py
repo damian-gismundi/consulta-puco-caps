@@ -1,8 +1,7 @@
-import os
-import re
-import requests
+import asyncio
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
+from playwright.async_api import async_playwright
 
 app = FastAPI()
 
@@ -30,6 +29,7 @@ HTML_CONTENT = """
     .item-val { font-size: 1.05rem; color: #0f172a; font-weight: 600; margin-top: 2px; }
     .cobertura-card { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 12px; margin-bottom: 8px; }
     .cobertura-nombre { font-size: 1rem; font-weight: bold; color: #166534; }
+    .cobertura-detalle { font-size: 0.85rem; color: #374151; margin-top: 2px; }
     .badge-publico { display: inline-block; padding: 8px 12px; border-radius: 6px; font-size: 0.95rem; font-weight: bold; background: #fef3c7; color: #92400e; }
     .alert-error { background: #fef2f2; color: #991b1b; padding: 12px; border-radius: 8px; border: 1px solid #fecaca; margin-top: 15px; font-size: 0.9rem; }
   </style>
@@ -89,7 +89,8 @@ HTML_CONTENT = """
           data.coberturas.forEach(c => {
             cobContainer.innerHTML += `
               <div class="cobertura-card">
-                <div class="cobertura-nombre">${c}</div>
+                <div class="cobertura-nombre">${c.cobertura}</div>
+                <div class="cobertura-detalle">Doc: ${c.tipodoc} ${c.nrodoc}</div>
               </div>
             `;
           });
@@ -116,83 +117,78 @@ def index():
     return HTML_CONTENT
 
 @app.get("/api/puco/{dni}")
-def get_puco(dni: str):
+async def get_puco(dni: str):
     dni_limpio = "".join(filter(str.isdigit, dni))
     if not dni_limpio:
         return {"error": "DNI inválido"}
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Language": "es-419,es;q=0.9",
-        "Origin": "https://sisa.msal.gov.ar",
-        "Referer": "https://sisa.msal.gov.ar/sisa/",
-    })
-
     try:
-        # 1. Landing inicial para registrar cookies de sesión en el balanceador
-        session.get("https://sisa.msal.gov.ar/sisa/", timeout=10)
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
 
-        # 2. Obtener el script GWT que inicializa el módulo en el servidor
-        session.get("https://sisa.msal.gov.ar/sisa/sisa/sisa.nocache.js", timeout=10)
+            # Ir a la landing de SISA
+            await page.goto("https://sisa.msal.gov.ar/sisa/#sisa", timeout=45000)
 
-        # 3. Headers para GWT-RPC
-        headers_rpc = {
-            "Content-Type": "text/x-gwt-rpc; charset=UTF-8",
-            "X-GWT-Module-Base": "https://sisa.msal.gov.ar/sisa/sisa/",
-            "X-GWT-Permutation": "93043F93A2BBFCE894385D3E4952CA2D",
-        }
-
-        payload = (
-            f"7|0|14|https://sisa.msal.gov.ar/sisa/sisa/|5CFBDB55F3DE4A47FE42E765E5AA02D3|"
-            f"ar.gob.msal.sisa.client.commons.components.lista.service.ListService|getPage|"
-            f"java.lang.Integer/3438268394|java.util.List|Z|"
-            f"ar.gob.msal.sisa.shared.model.list.ComplexFilter/30068811|java.util.ArrayList/4159755760|"
-            f"ar.gob.msal.sisa.client.commons.components.lista.simple.SearchFilter/1978531670|97390|"
-            f"ar.gob.msal.sisa.client.entitys.list.Filter$OPERATION/3408968308|"
-            f"ar.gob.msal.sisa.client.entitys.list.Filter$OPERATOR/860546718|{dni_limpio}|"
-            f"1|2|3|4|10|5|5|5|6|6|5|7|5|6|8|5|790|5|1|-2|9|0|9|1|10|11|12|0|13|0|0|14|0|0|1|5|25|0|0|"
-        )
-
-        res = session.post(
-            "https://sisa.msal.gov.ar/sisa/sisa/service/list",
-            data=payload,
-            headers=headers_rpc,
-            timeout=15
-        )
-
-        raw_text = res.text
-
-        if "SessionTimeOutException" in raw_text:
-            return {"error": "SISA exige sesión activa iniciada en el navegador. Conviene habilitar la cuota del usuario oficial para evitar bloqueos de sesión."}
-
-        if not raw_text.startswith("//OK"):
-            return {"error": f"SISA respondió: {raw_text[:120]}"}
-
-        # Extraer cadenas de la serialización GWT
-        matches = re.findall(r'"([^"]*)"', raw_text)
-
-        coberturas = []
-        nombre = None
-        ignorar = re.compile(r'^(ar\.gob|java\.|DNI|M|F|X|[0-9]+)$', re.IGNORECASE)
-
-        for s in matches:
-            s_clean = s.strip()
-            if not s_clean or ignorar.match(s_clean):
-                continue
+            # Esperar a que aparezca el input de texto del buscador
+            input_locator = page.locator('input[type="text"]').first
+            await input_locator.wait_for(timeout=20000)
             
-            if ("," in s_clean or " " in s_clean) and not any(p in s_clean for p in ["O.S.", "SWISS", "MEDIC", "OBRA SOCIAL", "IOMA", "OSDE", "PAMI", "S.A."]):
-                if not nombre and len(s_clean) > 4:
-                    nombre = s_clean
-            elif any(p in s_clean for p in ["O.S.", "OS", "IOMA", "SWISS", "MEDIC", "S.A.", "OBRA SOCIAL", "PAMI", "OSDE", "SALUD"]):
-                if s_clean not in coberturas:
-                    coberturas.append(s_clean)
+            # Escribir el DNI
+            await input_locator.fill(dni_limpio)
 
-        return {
-            "nombre": nombre or "Paciente identificado",
-            "coberturas": coberturas
-        }
+            # Hacer clic en el botón Buscar
+            btn_buscar = page.locator('button:has-text("Buscar")').first
+            await btn_buscar.click()
+
+            # Esperar a que renderice la tabla de resultados (damos unos segundos para que cargue GWT)
+            await page.wait_for_timeout(3500)
+
+            # Extraer las filas de la tabla de resultados
+            filas_datos = []
+            rows = page.locator("table tr")
+            count = await rows.count()
+
+            nombre_encontrado = None
+
+            for i in range(count):
+                row = rows.nth(i)
+                text = await row.inner_text()
+                # Verificar si la fila contiene el DNI buscado para asegurarnos de que es un resultado válido
+                if dni_limpio in text:
+                    cols = [c.strip() for c in text.split("\t") if c.strip()]
+                    if len(cols) >= 5:
+                        # Estructura típica SISA: TipoDoc | NroDoc | Sexo | Cobertura | Denominación
+                        tipodoc = cols[0]
+                        nrodoc = cols[1]
+                        cobertura = cols[3]
+                        denominacion = cols[4]
+                        
+                        if not nombre_encontrado:
+                            nombre_encontrado = denominacion
+
+                        filas_datos.append({
+                            "tipodoc": tipodoc,
+                            "nrodoc": nrodoc,
+                            "cobertura": cobertura
+                        })
+                    elif len(cols) >= 4:
+                        cobertura = cols[2]
+                        denominacion = cols[3]
+                        if not nombre_encontrado:
+                            nombre_encontrado = denominacion
+                        filas_datos.append({
+                            "tipodoc": "DNI",
+                            "nrodoc": dni_limpio,
+                            "cobertura": cobertura
+                        })
+
+            await browser.close()
+
+            return {
+                "nombre": nombre_encontrado,
+                "coberturas": filas_datos
+            }
 
     except Exception as e:
-        return {"error": f"Error de conexión: {str(e)}"}
+        return {"error": f"Error al ejecutar automatización: {str(e)}"}
