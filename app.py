@@ -1,13 +1,9 @@
-import os
+import re
 import requests
-import xml.etree.ElementTree as ET
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 app = FastAPI()
-
-SISA_USER = os.getenv("SISA_USER", "")
-SISA_PASS = os.getenv("SISA_PASS", "")
 
 HTML_CONTENT = """
 <!DOCTYPE html>
@@ -33,7 +29,6 @@ HTML_CONTENT = """
     .item-val { font-size: 1.05rem; color: #0f172a; font-weight: 600; margin-top: 2px; }
     .cobertura-card { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 12px; margin-bottom: 8px; }
     .cobertura-nombre { font-size: 1rem; font-weight: bold; color: #166534; }
-    .cobertura-rnos { font-size: 0.8rem; color: #15803d; margin-top: 4px; }
     .badge-publico { display: inline-block; padding: 8px 12px; border-radius: 6px; font-size: 0.95rem; font-weight: bold; background: #fef3c7; color: #92400e; }
     .alert-error { background: #fef2f2; color: #991b1b; padding: 12px; border-radius: 8px; border: 1px solid #fecaca; margin-top: 15px; font-size: 0.9rem; }
   </style>
@@ -80,12 +75,12 @@ HTML_CONTENT = """
         const data = await resp.json();
 
         if (data.error) {
-          errBox.innerText = `SISA: ${data.error}`;
+          errBox.innerText = data.error;
           errBox.style.display = 'block';
           return;
         }
 
-        document.getElementById('res-nombre').innerText = data.nombre || 'No registrado';
+        document.getElementById('res-nombre').innerText = data.nombre || 'No informado';
         const cobContainer = document.getElementById('res-coberturas');
         cobContainer.innerHTML = '';
 
@@ -93,8 +88,7 @@ HTML_CONTENT = """
           data.coberturas.forEach(c => {
             cobContainer.innerHTML += `
               <div class="cobertura-card">
-                <div class="cobertura-nombre">${c.coberturaSocial}</div>
-                <div class="cobertura-rnos">RNOS: ${c.rnos || 'S/D'}</div>
+                <div class="cobertura-nombre">${c}</div>
               </div>
             `;
           });
@@ -104,7 +98,7 @@ HTML_CONTENT = """
 
         box.style.display = 'block';
       } catch (e) {
-        errBox.innerText = 'Error al conectar con el servidor. Intente nuevamente.';
+        errBox.innerText = 'Error al conectar con el servidor.';
         errBox.style.display = 'block';
       } finally {
         btn.disabled = false;
@@ -123,65 +117,78 @@ def index():
 @app.get("/api/puco/{dni}")
 def get_puco(dni: str):
     dni_limpio = "".join(filter(str.isdigit, dni))
-    
-    if not SISA_USER or not SISA_PASS:
-        return {"error": "Faltan configurar las variables SISA_USER y SISA_PASS en Render"}
+    if not dni_limpio:
+        return {"error": "DNI inválido"}
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Origin": "https://sisa.msal.gov.ar",
+        "Referer": "https://sisa.msal.gov.ar/sisa/",
+        "Accept": "*/*",
+        "Accept-Language": "es-419,es;q=0.9",
+        "X-GWT-Module-Base": "https://sisa.msal.gov.ar/sisa/sisa/",
+        "X-GWT-Permutation": "93043F93A2BBFCE894385D3E4952CA2D",
+        "Content-Type": "text/x-gwt-rpc; charset=UTF-8",
+    })
 
     try:
-        url = f"https://sisa.msal.gov.ar/sisa/services/rest/puco/{dni_limpio}"
-        res = requests.post(
-            url, 
-            json={"usuario": SISA_USER, "clave": SISA_PASS}, 
-            headers={"Content-Type": "application/json"},
-            timeout=10
+        # 1. Obtener cookie de sesión anónima
+        session.get("https://sisa.msal.gov.ar/sisa/", timeout=10)
+
+        # 2. Armar el payload GWT-RPC inyectando el DNI en la posición de búsqueda
+        payload = (
+            f"7|0|14|https://sisa.msal.gov.ar/sisa/sisa/|5CFBDB55F3DE4A47FE42E765E5AA02D3|"
+            f"ar.gob.msal.sisa.client.commons.components.lista.service.ListService|getPage|"
+            f"java.lang.Integer/3438268394|java.util.List|Z|"
+            f"ar.gob.msal.sisa.shared.model.list.ComplexFilter/30068811|java.util.ArrayList/4159755760|"
+            f"ar.gob.msal.sisa.client.commons.components.lista.simple.SearchFilter/1978531670|97390|"
+            f"ar.gob.msal.sisa.client.entitys.list.Filter$OPERATION/3408968308|"
+            f"ar.gob.msal.sisa.client.entitys.list.Filter$OPERATOR/860546718|{dni_limpio}|"
+            f"1|2|3|4|10|5|5|5|6|6|5|7|5|6|8|5|790|5|1|-2|9|0|9|1|10|11|12|0|13|0|0|14|0|0|1|5|25|0|0|"
         )
-        
-        # En caso de error HTTP de red o endpoint
-        if res.status_code != 200:
-            return {"error": f"HTTP {res.status_code}: {res.text[:100]}"}
 
-        # Parsear XML retornado por SISA
-        root = ET.fromstring(res.text)
-        
-        # SISA puede devolver <puco> con hijos directos o múltiples nodos
-        resultado = root.findtext("resultado") or ""
+        # 3. Consultar servicio interno
+        res = session.post(
+            "https://sisa.msal.gov.ar/sisa/sisa/service/list",
+            data=payload,
+            timeout=15
+        )
 
-        # Manejo de errores de credenciales o cuota
-        if resultado in ["ERROR_AUTENTICACION", "NO_TIENE_QUOTA_DISPONIBLE", "ERROR_DATOS", "ERROR_INESPERADO"]:
-            return {"error": f"{resultado} (Revise usuario/clave o cuota asignada en SISA)"}
+        raw_text = res.text
 
-        # Extraer registros: buscar si vienen en elementos anidados o en la raíz
-        registros = []
-        pucos = root.findall(".//puco") or root.findall(".//return")
-        
-        if pucos:
-            for item in pucos:
-                cob = item.findtext("coberturaSocial")
-                if cob:
-                    registros.append({
-                        "coberturaSocial": cob,
-                        "rnos": item.findtext("rnos") or "",
-                        "denominacion": item.findtext("denominacion") or ""
-                    })
-        else:
-            # Caso de resultado único en la raíz
-            cob = root.findtext("coberturaSocial")
-            if cob:
-                registros.append({
-                    "coberturaSocial": cob,
-                    "rnos": root.findtext("rnos") or "",
-                    "denominacion": root.findtext("denominacion") or ""
-                })
+        # GWT responde con prefijo '//OK' cuando la llamada es exitosa
+        if not raw_text.startswith("//OK"):
+            return {"error": f"SISA no respondió correctamente: {raw_text[:120]}"}
 
-        nombre = registros[0]["denominacion"] if registros else (root.findtext("denominacion") or "-")
+        # 4. Extraer strings del payload serializado de GWT
+        # El formato GWT devuelve una lista serializada: //OK[...,["str1","str2",...],...]
+        matches = re.findall(r'"([^"]*)"', raw_text)
+
+        coberturas = []
+        nombre = None
+
+        # Expresión para descartar clases internas de Java/GWT y metadatos
+        ignorar = re.compile(r'^(ar\.gob|java\.|DNI|M|F|X|[0-9]+)$', re.IGNORECASE)
+
+        for s in matches:
+            s_clean = s.strip()
+            if not s_clean or ignorar.match(s_clean):
+                continue
+            
+            # Si parece nombre y apellido (contiene coma o apellidos típicos)
+            if ("," in s_clean or s_clean.isupper()) and not any(p in s_clean for p in ["O.S.", "SWISS", "MEDIC", "OBRA SOCIAL", "IOMA", "OSDE", "PAMI", "S.A."]):
+                if not nombre:
+                    nombre = s_clean
+            # Si parece obra social o prepaga
+            elif any(p in s_clean for p in ["O.S.", "OS", "IOMA", "SWISS", "MEDIC", "S.A.", "OBRA SOCIAL", "PAMI", "OSDE", "SALUD", "UNION", "ASOCIACION"]):
+                if s_clean not in coberturas:
+                    coberturas.append(s_clean)
 
         return {
-            "nombre": nombre,
-            "coberturas": registros,
-            "resultado_sisa": resultado or "OK"
+            "nombre": nombre or "Paciente identificado",
+            "coberturas": coberturas
         }
 
-    except ET.ParseError:
-        return {"error": f"Respuesta no válida de SISA: {res.text[:120]}"}
     except Exception as e:
-        return {"error": f"Excepción interna: {str(e)}"}
+        return {"error": f"Excepción en la consulta: {str(e)}"}
