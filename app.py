@@ -124,38 +124,54 @@ async def get_puco(dni: str):
 
     try:
         async with async_playwright() as p:
-            # Lanzar Chromium con flags para entornos cloud reducidos
             browser = await p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu"
+                ]
             )
-            page = await browser.new_page()
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800}
+            )
+            page = await context.new_page()
 
-            # 1. Cargar la home de SISA
-            await page.goto("https://sisa.msal.gov.ar/sisa/#sisa", timeout=45000)
+            # 1. Cargar la página esperando que el DOM básico esté listo
+            await page.goto("https://sisa.msal.gov.ar/sisa/#sisa", wait_until="domcontentloaded", timeout=60000)
 
-            # 2. Hacer clic en el acceso directo de PUCO
-            # Buscamos el elemento que contiene el texto PUCO en los banners/tarjetas
-            boton_puco = page.locator('text="PUCO"').first
-            await boton_puco.wait_for(timeout=15000)
-            await boton_puco.click()
+            # 2. Si todavía no está en la pantalla del padrón, buscar y hacer clic en PUCO
+            # Intentamos detectar si ya está visible el buscador o si hay que clickear la tarjeta
+            input_existente = page.locator('input[placeholder*="valor"]')
+            if await input_existente.count() == 0:
+                # Buscamos cualquier botón o tarjeta que mencione PUCO
+                tarjeta_puco = page.locator('div:has-text("PUCO"), span:has-text("PUCO"), a:has-text("PUCO")').last
+                try:
+                    await tarjeta_puco.wait_for(timeout=25000)
+                    await tarjeta_puco.click()
+                except Exception:
+                    # Si no encuentra por texto, forzamos navegación directa por hash
+                    await page.evaluate("window.location.hash = '#puco'")
 
-            # 3. Esperar que aparezca el campo de texto de búsqueda de PUCO
-            # En la captura de SISA el placeholder es "Ingrese el valor"
-            input_dni = page.locator('input[placeholder*="valor"], input[type="text"]:visible').first
-            await input_dni.wait_for(timeout=20000)
+            # 3. Esperar que el input de búsqueda del padrón esté visible
+            # Filtramos específicamente el input que tiene 'valor' o que no es el de usuario/login
+            input_dni = page.locator('input[placeholder*="valor"], input:not([placeholder*="suario"]):not([type="password"]):visible').first
+            await input_dni.wait_for(timeout=25000)
             
-            # 4. Escribir el DNI
+            # Limpiar y escribir el DNI
+            await input_dni.click()
             await input_dni.fill(dni_limpio)
 
-            # 5. Clic en Buscar
-            btn_buscar = page.locator('button:has-text("Buscar"), div[role="button"]:has-text("Buscar")').first
+            # 4. Clic en Buscar
+            btn_buscar = page.locator('button:has-text("Buscar"), div[role="button"]:has-text("Buscar"), .btn:has-text("Buscar")').first
             await btn_buscar.click()
 
-            # 6. Esperar a que la tabla cargue los resultados
-            await page.wait_for_timeout(3500)
+            # 5. Esperar a que responda el grid de resultados
+            await page.wait_for_timeout(4000)
 
-            # 7. Extraer los datos de las filas
+            # 6. Extraer resultados
             filas_datos = []
             nombre_encontrado = None
 
