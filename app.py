@@ -1,9 +1,13 @@
-import asyncio
+import os
+import requests
+import xml.etree.ElementTree as ET
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from playwright.async_api import async_playwright
 
 app = FastAPI()
+
+SISA_USER = os.getenv("SISA_USER", "")
+SISA_PASS = os.getenv("SISA_PASS", "")
 
 HTML_CONTENT = """
 <!DOCTYPE html>
@@ -29,7 +33,7 @@ HTML_CONTENT = """
     .item-val { font-size: 1.05rem; color: #0f172a; font-weight: 600; margin-top: 2px; }
     .cobertura-card { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 12px; margin-bottom: 8px; }
     .cobertura-nombre { font-size: 1rem; font-weight: bold; color: #166534; }
-    .cobertura-detalle { font-size: 0.85rem; color: #374151; margin-top: 2px; }
+    .cobertura-rnos { font-size: 0.8rem; color: #15803d; margin-top: 4px; }
     .badge-publico { display: inline-block; padding: 8px 12px; border-radius: 6px; font-size: 0.95rem; font-weight: bold; background: #fef3c7; color: #92400e; }
     .alert-error { background: #fef2f2; color: #991b1b; padding: 12px; border-radius: 8px; border: 1px solid #fecaca; margin-top: 15px; font-size: 0.9rem; }
   </style>
@@ -76,12 +80,12 @@ HTML_CONTENT = """
         const data = await resp.json();
 
         if (data.error) {
-          errBox.innerText = data.error;
+          errBox.innerText = `SISA: ${data.error}`;
           errBox.style.display = 'block';
           return;
         }
 
-        document.getElementById('res-nombre').innerText = data.nombre || 'No informado';
+        document.getElementById('res-nombre').innerText = data.nombre || 'No registrado';
         const cobContainer = document.getElementById('res-coberturas');
         cobContainer.innerHTML = '';
 
@@ -89,8 +93,8 @@ HTML_CONTENT = """
           data.coberturas.forEach(c => {
             cobContainer.innerHTML += `
               <div class="cobertura-card">
-                <div class="cobertura-nombre">${c.cobertura}</div>
-                <div class="cobertura-detalle">Doc: ${c.tipodoc} ${c.nrodoc}</div>
+                <div class="cobertura-nombre">${c.coberturaSocial}</div>
+                <div class="cobertura-rnos">Código RNOS: ${c.rnos || 'S/D'}</div>
               </div>
             `;
           });
@@ -100,7 +104,7 @@ HTML_CONTENT = """
 
         box.style.display = 'block';
       } catch (e) {
-        errBox.innerText = 'Error al conectar con el servidor.';
+        errBox.innerText = 'Error de conexión con el servidor.';
         errBox.style.display = 'block';
       } finally {
         btn.disabled = false;
@@ -117,104 +121,60 @@ def index():
     return HTML_CONTENT
 
 @app.get("/api/puco/{dni}")
-async def get_puco(dni: str):
+def get_puco(dni: str):
     dni_limpio = "".join(filter(str.isdigit, dni))
     if not dni_limpio:
         return {"error": "DNI inválido"}
+    
+    if not SISA_USER or not SISA_PASS:
+        return {"error": "Faltan configurar las credenciales SISA en Render"}
 
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu"
-                ]
-            )
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800}
-            )
-            page = await context.new_page()
+        url = f"https://sisa.msal.gov.ar/sisa/services/rest/puco/{dni_limpio}"
+        res = requests.post(
+            url, 
+            json={"usuario": SISA_USER, "clave": SISA_PASS}, 
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        
+        if res.status_code != 200:
+            return {"error": f"HTTP {res.status_code}: {res.text[:100]}"}
 
-            # 1. Cargar la página esperando que el DOM básico esté listo
-            await page.goto("https://sisa.msal.gov.ar/sisa/#sisa", wait_until="domcontentloaded", timeout=60000)
+        root = ET.fromstring(res.text)
+        resultado = root.findtext("resultado") or ""
 
-            # 2. Si todavía no está en la pantalla del padrón, buscar y hacer clic en PUCO
-            # Intentamos detectar si ya está visible el buscador o si hay que clickear la tarjeta
-            input_existente = page.locator('input[placeholder*="valor"]')
-            if await input_existente.count() == 0:
-                # Buscamos cualquier botón o tarjeta que mencione PUCO
-                tarjeta_puco = page.locator('div:has-text("PUCO"), span:has-text("PUCO"), a:has-text("PUCO")').last
-                try:
-                    await tarjeta_puco.wait_for(timeout=25000)
-                    await tarjeta_puco.click()
-                except Exception:
-                    # Si no encuentra por texto, forzamos navegación directa por hash
-                    await page.evaluate("window.location.hash = '#puco'")
+        if resultado in ["ERROR_AUTENTICACION", "NO_TIENE_QUOTA_DISPONIBLE", "ERROR_DATOS", "ERROR_INESPERADO"]:
+            return {"error": f"{resultado} (Falta asignación de cuota en SISA)"}
 
-            # 3. Esperar que el input de búsqueda del padrón esté visible
-            # Filtramos específicamente el input que tiene 'valor' o que no es el de usuario/login
-            input_dni = page.locator('input[placeholder*="valor"], input:not([placeholder*="suario"]):not([type="password"]):visible').first
-            await input_dni.wait_for(timeout=25000)
-            
-            # Limpiar y escribir el DNI
-            await input_dni.click()
-            await input_dni.fill(dni_limpio)
+        registros = []
+        pucos = root.findall(".//puco") or root.findall(".//return")
+        
+        if pucos:
+            for item in pucos:
+                cob = item.findtext("coberturaSocial")
+                if cob:
+                    registros.append({
+                        "coberturaSocial": cob,
+                        "rnos": item.findtext("rnos") or "",
+                        "denominacion": item.findtext("denominacion") or ""
+                    })
+        else:
+            cob = root.findtext("coberturaSocial")
+            if cob:
+                registros.append({
+                    "coberturaSocial": cob,
+                    "rnos": root.findtext("rnos") or "",
+                    "denominacion": root.findtext("denominacion") or ""
+                })
 
-            # 4. Clic en Buscar
-            btn_buscar = page.locator('button:has-text("Buscar"), div[role="button"]:has-text("Buscar"), .btn:has-text("Buscar")').first
-            await btn_buscar.click()
+        nombre = registros[0]["denominacion"] if registros else (root.findtext("denominacion") or "-")
 
-            # 5. Esperar a que responda el grid de resultados
-            await page.wait_for_timeout(4000)
-
-            # 6. Extraer resultados
-            filas_datos = []
-            nombre_encontrado = None
-
-            rows = page.locator("table tr")
-            count = await rows.count()
-
-            for i in range(count):
-                row = rows.nth(i)
-                text = await row.inner_text()
-                
-                if dni_limpio in text:
-                    cols = [c.strip() for c in text.split("\t") if c.strip()]
-                    if len(cols) >= 5:
-                        tipodoc = cols[0]
-                        nrodoc = cols[1]
-                        cobertura = cols[3]
-                        denominacion = cols[4]
-
-                        if not nombre_encontrado:
-                            nombre_encontrado = denominacion
-
-                        filas_datos.append({
-                            "tipodoc": tipodoc,
-                            "nrodoc": nrodoc,
-                            "cobertura": cobertura
-                        })
-                    elif len(cols) >= 4:
-                        cobertura = cols[2]
-                        denominacion = cols[3]
-                        if not nombre_encontrado:
-                            nombre_encontrado = denominacion
-                        filas_datos.append({
-                            "tipodoc": "DNI",
-                            "nrodoc": dni_limpio,
-                            "cobertura": cobertura
-                        })
-
-            await browser.close()
-
-            return {
-                "nombre": nombre_encontrado,
-                "coberturas": filas_datos
-            }
+        return {
+            "nombre": nombre,
+            "coberturas": registros,
+            "resultado_sisa": resultado or "OK"
+        }
 
     except Exception as e:
-        return {"error": f"Error al ejecutar automatización: {str(e)}"}
+        return {"error": f"Error interno: {str(e)}"}
